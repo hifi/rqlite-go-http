@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,8 +20,8 @@ import (
 )
 
 func init() {
-	sql.Register("rqlite-nobegin", &stdlib.Driver{ErrorOnBegin: true})
 	sql.Register("rqlite-lb", &stdlib.Driver{LoadBalancer: failingLoadBalancer{}})
+	sql.Register("rqlite-allowquery", &stdlib.Driver{AllowQueryInTxn: true})
 }
 
 var _ rqlitehttp.LoadBalancer = (*failingLoadBalancer)(nil)
@@ -794,17 +793,129 @@ func Test_EndToEnd_NamedParameters(t *testing.T) {
 
 func Test_EndToEnd_NoBegin(t *testing.T) {
 	db := testDatabase(t, "rqlite")
+	defer db.Close()
+
 	if _, err := db.Begin(); err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+}
 
-	db = testDatabase(t, "rqlite-nobegin")
+func Test_EndToEnd_TxCommit(t *testing.T) {
+	db := testDatabase(t)
 	defer db.Close()
 
-	if _, err := db.Begin(); !errors.Is(err, driver.ErrSkip) {
-		t.Fatal("expected transaction begin to fail with driver.ErrSkip")
+	_, _ = db.Exec("DROP TABLE IF EXISTS test_txcommit")
+	defer db.Exec("DROP TABLE IF EXISTS test_txcommit")
+
+	if _, err := db.Exec("CREATE TABLE test_txcommit (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
 	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO test_txcommit (id, name) VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO test_txcommit (id, name) VALUES (2, 'bob')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := collectIDs(t, db, "test_txcommit")
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Fatalf("expected ids [1 2], got %v", ids)
+	}
+}
+
+func Test_EndToEnd_TxRollback(t *testing.T) {
+	db := testDatabase(t)
+	defer db.Close()
+
+	_, _ = db.Exec("DROP TABLE IF EXISTS test_txrollback")
+	defer db.Exec("DROP TABLE IF EXISTS test_txrollback")
+
+	if _, err := db.Exec("CREATE TABLE test_txrollback (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO test_txrollback (id, name) VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := collectIDs(t, db, "test_txrollback")
+	if len(ids) != 0 {
+		t.Fatalf("expected no rows after rollback, got %v", ids)
+	}
+}
+
+func Test_EndToEnd_TxCommitWithError(t *testing.T) {
+	db := testDatabase(t)
+	defer db.Close()
+
+	_, _ = db.Exec("DROP TABLE IF EXISTS test_txcommiterror")
+	defer db.Exec("DROP TABLE IF EXISTS test_txcommiterror")
+
+	if _, err := db.Exec("CREATE TABLE test_txcommiterror (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO test_txcommiterror (id, name) VALUES (1, 'alice')"); err != nil {
+		t.Fatal(err)
+	}
+	// Duplicate PK — will fail at commit time
+	if _, err := tx.Exec("INSERT INTO test_txcommiterror (id, name) VALUES (1, 'duplicate')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); !errors.Is(err, stdlib.ErrQuery) {
+		t.Fatalf("expected ErrQuery from Commit, got: %v", err)
+	}
+}
+
+func Test_EndToEnd_QueryInTransactionBlocked(t *testing.T) {
+	db := testDatabase(t, "rqlite")
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Query("SELECT 1"); !errors.Is(err, stdlib.ErrQuery) {
+		t.Fatalf("expected ErrQuery when querying inside transaction without AllowQueryInTxn, got: %v", err)
+	}
+}
+
+func Test_EndToEnd_QueryInTransactionAllowed(t *testing.T) {
+	db := testDatabase(t, "rqlite-allowquery")
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query("SELECT 1")
+	if err != nil {
+		t.Fatalf("expected query to succeed with AllowQueryInTxn, got: %v", err)
+	}
+	rows.Close()
 }
 
 func collectIDs(t *testing.T, db *sql.DB, table string) []int64 {

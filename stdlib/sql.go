@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	rqlitehttp "github.com/rqlite/rqlite-go-http"
 )
 
 var _ driver.Driver = (*Driver)(nil)
 var _ driver.Conn = (*Conn)(nil)
+var _ driver.ConnBeginTx = (*Conn)(nil)
 var _ driver.StmtExecContext = (*Stmt)(nil)
 var _ driver.StmtQueryContext = (*Stmt)(nil)
 var _ driver.NamedValueChecker = (*Stmt)(nil)
@@ -30,7 +32,11 @@ type Driver struct {
 	BasicAuthUser string
 	BasicAuthPass string
 
-	ErrorOnBegin bool
+	// AllowQueryInTxn permits Query/QueryContext calls during a transaction.
+	// When true the query executes directly against the database outside the
+	// buffered transaction. When false (default) any Query inside a transaction
+	// returns ErrQuery immediately.
+	AllowQueryInTxn bool
 }
 
 func (d *Driver) Open(name string) (_ driver.Conn, err error) {
@@ -50,15 +56,17 @@ func (d *Driver) Open(name string) (_ driver.Conn, err error) {
 	}
 
 	return &Conn{
-		Client:       client,
-		errorOnBegin: d.ErrorOnBegin,
+		Client:          client,
+		allowQueryInTxn: d.AllowQueryInTxn,
 	}, nil
 }
 
 type Conn struct {
 	*rqlitehttp.Client
 
-	errorOnBegin bool
+	allowQueryInTxn bool
+	inTransaction   bool
+	txBuffer        []*rqlitehttp.SQLStatement
 }
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
@@ -70,17 +78,54 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) Begin() (driver.Tx, error) {
-	if c.errorOnBegin {
-		return nil, fmt.Errorf("%w: Begin() called for rqlite connection", driver.ErrSkip)
-	}
-
-	return &Tx{}, nil
+	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-type Tx struct{}
+func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	c.inTransaction = true
+	c.txBuffer = nil
+	return &Tx{conn: c, ctx: ctx}, nil
+}
 
-func (tx *Tx) Commit() error   { return nil }
-func (tx *Tx) Rollback() error { return nil }
+type Tx struct {
+	conn *Conn
+	ctx  context.Context
+}
+
+func (tx *Tx) Commit() error {
+	c := tx.conn
+	c.inTransaction = false
+	defer func() { c.txBuffer = nil }()
+
+	if len(c.txBuffer) == 0 {
+		return nil
+	}
+
+	er, err := c.Execute(tx.ctx, rqlitehttp.SQLStatements(c.txBuffer), &rqlitehttp.ExecuteOptions{Transaction: true})
+	if err != nil {
+		return err
+	}
+	if er.Error != "" {
+		return fmt.Errorf("%w: %s", ErrRequest, er.Error)
+	}
+
+	var errs []string
+	for _, result := range er.Results {
+		if result.Error != "" {
+			errs = append(errs, result.Error)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: %s", ErrQuery, strings.Join(errs, ", "))
+	}
+	return nil
+}
+
+func (tx *Tx) Rollback() error {
+	tx.conn.inTransaction = false
+	tx.conn.txBuffer = nil
+	return nil
+}
 
 type Result struct {
 	result rqlitehttp.ExecuteResult
@@ -141,6 +186,16 @@ func buildParams(args []driver.NamedValue) ([]any, map[string]any) {
 
 func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
 	positionalParams, namedParams := buildParams(args)
+
+	if s.Conn.inTransaction {
+		s.Conn.txBuffer = append(s.Conn.txBuffer, &rqlitehttp.SQLStatement{
+			SQL:              s.Stmt,
+			PositionalParams: positionalParams,
+			NamedParams:      namedParams,
+		})
+		return &Result{}, nil
+	}
+
 	er, err := s.Conn.Execute(ctx, rqlitehttp.SQLStatements{
 		&rqlitehttp.SQLStatement{
 			SQL:              s.Stmt,
@@ -167,6 +222,10 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if s.Conn.inTransaction && !s.Conn.allowQueryInTxn {
+		return nil, fmt.Errorf("%w: Query not allowed during transaction", ErrQuery)
+	}
+
 	positionalParams, namedParams := buildParams(args)
 	qr, err := s.Conn.Query(ctx, rqlitehttp.SQLStatements{
 		&rqlitehttp.SQLStatement{
