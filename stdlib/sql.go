@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 
 	rqlitehttp "github.com/rqlite/rqlite-go-http"
 )
@@ -30,6 +31,14 @@ type Driver struct {
 	// Basic authentication can also be passed in the DSN: http://foo:bar@host:port
 	BasicAuthUser string
 	BasicAuthPass string
+
+	// QueryOptions holds default options for every /db/query request.
+	// BlobAsArray is always forced to true.
+	QueryOptions rqlitehttp.QueryOptions
+
+	// ExecuteOptions holds default options for every /db/execute request.
+	// Transaction is always forced to true for transaction commits.
+	ExecuteOptions rqlitehttp.ExecuteOptions
 
 	// AllowQueryInTxn permits Query/QueryContext calls during a transaction.
 	// When true the query executes directly against the database outside the
@@ -57,6 +66,8 @@ func (d *Driver) Open(name string) (_ driver.Conn, err error) {
 	return &Conn{
 		Client:          client,
 		allowQueryInTxn: d.AllowQueryInTxn,
+		queryOptions:    d.QueryOptions,
+		execOptions:     d.ExecuteOptions,
 	}, nil
 }
 
@@ -64,6 +75,8 @@ type Conn struct {
 	*rqlitehttp.Client
 
 	allowQueryInTxn bool
+	queryOptions    rqlitehttp.QueryOptions
+	execOptions     rqlitehttp.ExecuteOptions
 	inTransaction   bool
 	txBuffer        []*rqlitehttp.SQLStatement
 }
@@ -101,7 +114,9 @@ func (tx *Tx) Commit() error {
 		return nil
 	}
 
-	er, err := tx.conn.Execute(tx.ctx, rqlitehttp.SQLStatements(tx.conn.txBuffer), &rqlitehttp.ExecuteOptions{Transaction: true})
+	opts := tx.conn.execOptions
+	opts.Transaction = true
+	er, err := tx.conn.Execute(tx.ctx, rqlitehttp.SQLStatements(tx.conn.txBuffer), &opts)
 	if err != nil {
 		return err
 	} else if er.Error != "" {
@@ -207,7 +222,7 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 			PositionalParams: positionalParams,
 			NamedParams:      namedParams,
 		},
-	}, &rqlitehttp.ExecuteOptions{})
+	}, &s.Conn.execOptions)
 	if err != nil {
 		return nil, err
 	} else if er.Error != "" {
@@ -238,15 +253,15 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 		return nil, err
 	}
 
+	opts := s.Conn.queryOptions
+	opts.BlobAsArray = true
 	qr, err := s.Conn.Query(ctx, rqlitehttp.SQLStatements{
 		&rqlitehttp.SQLStatement{
 			SQL:              s.Stmt,
 			PositionalParams: positionalParams,
 			NamedParams:      namedParams,
 		},
-	}, &rqlitehttp.QueryOptions{
-		BlobAsArray: true,
-	})
+	}, &opts)
 	if err != nil {
 		return nil, err
 	} else if qr.Error != "" {
@@ -261,8 +276,45 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 			return nil, fmt.Errorf("%w: %w", ErrQuery, res[0].Error)
 		}
 		return &Rows{result: res[0]}, nil
+	case []rqlitehttp.QueryResultAssoc:
+		if len(res) == 0 {
+			return nil, fmt.Errorf("%w: no results returned", ErrQuery)
+		} else if res[0].Error != nil {
+			return nil, fmt.Errorf("%w: %w", ErrQuery, res[0].Error)
+		}
+		return &Rows{result: assocToPositional(res[0])}, nil
 	default:
 		return nil, fmt.Errorf("%w: result type '%T' not supported", ErrQuery, qr.Results)
+	}
+}
+
+// assocToPositional converts an associative result (rows as column->value maps)
+// into the positional form. The associative form carries no column order, so a
+// deterministic sorted order is derived from the union of all rows' keys.
+func assocToPositional(r rqlitehttp.QueryResultAssoc) rqlitehttp.QueryResult {
+	columnsSet := make(map[string]struct{})
+	for _, row := range r.Rows {
+		for col := range row {
+			columnsSet[col] = struct{}{}
+		}
+	}
+	columns := make([]string, 0, len(columnsSet))
+	for col := range columnsSet {
+		columns = append(columns, col)
+	}
+	sort.Strings(columns)
+
+	values := make([][]any, len(r.Rows))
+	for i, row := range r.Rows {
+		values[i] = make([]any, len(columns))
+		for j, col := range columns {
+			values[i][j] = row[col]
+		}
+	}
+
+	return rqlitehttp.QueryResult{
+		Columns: columns,
+		Values:  values,
 	}
 }
 

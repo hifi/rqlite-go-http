@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,17 +34,22 @@ func (_ failingLoadBalancer) Next() (*url.URL, error) {
 	return nil, rqlitehttp.ErrNoHostsAvailable
 }
 
-func testDatabase(t *testing.T, driver ...string) *sql.DB {
+func testEndpoint(t *testing.T) string {
 	t.Helper()
 	host, ok := os.LookupEnv("RQLITE_GO_HTTP_E2E_HOST")
 	if !ok {
 		t.Skip("Skipping: RQLITE_GO_HTTP_E2E_HOST not set")
 	}
+	return fmt.Sprintf("http://%s:4001", host)
+}
+
+func testDatabase(t *testing.T, driver ...string) *sql.DB {
+	t.Helper()
 	driverName := "rqlite"
 	if len(driver) > 0 {
 		driverName = driver[0]
 	}
-	db, err := sql.Open(driverName, fmt.Sprintf("http://%s:4001", host))
+	db, err := sql.Open(driverName, testEndpoint(t))
 	if err != nil {
 		t.Fatalf("sql.Open: %s", err)
 	}
@@ -1374,4 +1381,224 @@ func Test_EndToEnd_NumberConversionToScanDestinations(t *testing.T) {
 			t.Fatalf("string: got %q, want %q", s, "1.5")
 		}
 	})
+}
+
+type capturingTransport struct {
+	mu   sync.Mutex
+	urls []string
+}
+
+func (ct *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ct.mu.Lock()
+	ct.urls = append(ct.urls, req.URL.String())
+	ct.mu.Unlock()
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+func (ct *capturingTransport) urlsFor(path string) []string {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	var out []string
+	for _, u := range ct.urls {
+		if strings.Contains(u, path) {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// Test_EndToEnd_DriverOptions verifies that driver-level QueryOptions and
+// ExecuteOptions are applied to every /db/query and /db/execute request,
+// that BlobAsArray is always forced on queries, and that transaction
+// commits force transaction=true on top of the driver defaults.
+func Test_EndToEnd_DriverOptions(t *testing.T) {
+	baseURL := testEndpoint(t)
+
+	roTransport := &capturingTransport{}
+	sql.Register("rqlite-test-ro", &stdlib.Driver{
+		HTTPClient:   &http.Client{Transport: roTransport},
+		QueryOptions: rqlitehttp.QueryOptions{Level: rqlitehttp.ReadConsistencyLevelNone},
+	})
+	roDB := testDatabase(t, "rqlite-test-ro")
+	defer roDB.Close()
+
+	plainTransport := &capturingTransport{}
+	sql.Register("rqlite-test-plain", &stdlib.Driver{
+		HTTPClient: &http.Client{Transport: plainTransport},
+	})
+	plainDB := testDatabase(t, "rqlite-test-plain")
+	defer plainDB.Close()
+
+	execOptsTransport := &capturingTransport{}
+	sql.Register("rqlite-test-exec", &stdlib.Driver{
+		HTTPClient:     &http.Client{Transport: execOptsTransport},
+		ExecuteOptions: rqlitehttp.ExecuteOptions{Timings: true},
+	})
+	execDB := testDatabase(t, "rqlite-test-exec")
+	defer execDB.Close()
+
+	if _, err := roDB.Exec("CREATE TABLE opts_test (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	defer roDB.Exec("DROP TABLE IF EXISTS opts_test")
+	if _, err := roDB.Exec("INSERT INTO opts_test (id, name) VALUES (1, 'foo')"); err != nil {
+		t.Fatal(err)
+	}
+
+	var name string
+	if err := roDB.QueryRow("SELECT name FROM opts_test WHERE id = 1").Scan(&name); err != nil {
+		t.Fatal(err)
+	} else if name != "foo" {
+		t.Fatalf("expected %q, got %q", "foo", name)
+	}
+
+	// The read consistency level is applied to queries only.
+	queryURLs := roTransport.urlsFor("/db/query")
+	if len(queryURLs) != 1 {
+		t.Fatalf("expected 1 /db/query request, got %v", queryURLs)
+	}
+	if want := baseURL + "/db/query?blob_array=true&level=none"; queryURLs[0] != want {
+		t.Fatalf("unexpected query URL %q, want %q", queryURLs[0], want)
+	}
+
+	execURLs := roTransport.urlsFor("/db/execute")
+	if len(execURLs) != 2 {
+		t.Fatalf("expected 2 /db/execute requests, got %v", execURLs)
+	}
+	for _, u := range execURLs {
+		if strings.Contains(u, "level=") {
+			t.Fatalf("execute URL %q must not carry a consistency level", u)
+		}
+	}
+
+	// Zero-value QueryOptions keeps the previous behavior: no level param.
+	if err := plainDB.QueryRow("SELECT name FROM opts_test WHERE id = 1").Scan(&name); err != nil {
+		t.Fatal(err)
+	} else if name != "foo" {
+		t.Fatalf("expected %q, got %q", "foo", name)
+	}
+	plainQueryURLs := plainTransport.urlsFor("/db/query")
+	if len(plainQueryURLs) != 1 {
+		t.Fatalf("expected 1 /db/query request, got %v", plainQueryURLs)
+	}
+	if want := baseURL + "/db/query?blob_array=true"; plainQueryURLs[0] != want {
+		t.Fatalf("unexpected query URL %q, want %q", plainQueryURLs[0], want)
+	}
+
+	// Driver-level ExecuteOptions are applied to every execute request.
+	if _, err := execDB.Exec("CREATE TABLE exec_opts (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	defer execDB.Exec("DROP TABLE IF EXISTS exec_opts")
+	if _, err := execDB.Exec("INSERT INTO exec_opts (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+
+	execOptsURLs := execOptsTransport.urlsFor("/db/execute")
+	if len(execOptsURLs) != 2 {
+		t.Fatalf("expected 2 /db/execute requests, got %v", execOptsURLs)
+	}
+	for _, u := range execOptsURLs {
+		if want := baseURL + "/db/execute?timings=true"; u != want {
+			t.Fatalf("unexpected execute URL %q, want %q", u, want)
+		}
+	}
+
+	// Transaction commits force transaction=true on top of driver defaults.
+	tx, err := plainDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO opts_test (id, name) VALUES (2, 'bar')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	txExecURLs := plainTransport.urlsFor("/db/execute")
+	if len(txExecURLs) != 1 {
+		t.Fatalf("expected 1 /db/execute request, got %v", txExecURLs)
+	}
+	if want := baseURL + "/db/execute?transaction=true"; txExecURLs[0] != want {
+		t.Fatalf("unexpected execute URL %q, want %q", txExecURLs[0], want)
+	}
+}
+
+// Test_EndToEnd_DriverAssociative verifies that a driver configured with
+// QueryOptions.Associative receives rqlite's associative results and that
+// they are transparently converted to the positional form with a
+// deterministic (sorted) column order.
+func Test_EndToEnd_DriverAssociative(t *testing.T) {
+	baseURL := testEndpoint(t)
+
+	assocTransport := &capturingTransport{}
+	sql.Register("rqlite-test-assoc", &stdlib.Driver{
+		HTTPClient:   &http.Client{Transport: assocTransport},
+		QueryOptions: rqlitehttp.QueryOptions{Associative: true},
+	})
+	db := testDatabase(t, "rqlite-test-assoc")
+	defer db.Close()
+
+	// Declare columns in non-alphabetical order to prove the associative
+	// form yields a deterministic (sorted) column order.
+	if _, err := db.Exec("CREATE TABLE assoc (zebra TEXT, apple INTEGER, mid TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec("DROP TABLE IF EXISTS assoc")
+	if _, err := db.Exec("INSERT INTO assoc (zebra, apple, mid) VALUES ('z', 1, 'm')"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query("SELECT zebra, apple, mid FROM assoc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"apple", "mid", "zebra"}; len(columns) != len(want) {
+		t.Fatalf("expected columns %v, got %v", want, columns)
+	} else {
+		for i := range want {
+			if columns[i] != want[i] {
+				t.Fatalf("expected columns %v, got %v", want, columns)
+			}
+		}
+	}
+
+	if !rows.Next() {
+		t.Fatal("expected a row")
+	}
+	var apple int64
+	var mid, zebra string
+	if err := rows.Scan(&apple, &mid, &zebra); err != nil {
+		t.Fatal(err)
+	}
+	if apple != 1 {
+		t.Fatalf("expected apple=1, got %v", apple)
+	}
+	if mid != "m" {
+		t.Fatalf("expected mid=%q, got %q", "m", mid)
+	}
+	if zebra != "z" {
+		t.Fatalf("expected zebra=%q, got %q", "z", zebra)
+	}
+	if rows.Next() {
+		t.Fatal("expected no more rows")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	queryURLs := assocTransport.urlsFor("/db/query")
+	if len(queryURLs) != 1 {
+		t.Fatalf("expected 1 /db/query request, got %v", queryURLs)
+	}
+	if want := baseURL + "/db/query?associative=true&blob_array=true"; queryURLs[0] != want {
+		t.Fatalf("unexpected query URL %q, want %q", queryURLs[0], want)
+	}
 }
